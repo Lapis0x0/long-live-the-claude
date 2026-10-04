@@ -99,6 +99,10 @@ claude --plugin-dir .
 
 Inside that session, run `/plugin-types` to write the plugin API declarations to `.claude/types`; then `tsc -p tsconfig.json` type-checks the plugin and `claude plugin validate .claude-plugin/plugin.json` checks it the way Claude Code loads it.
 
+## Acknowledgements
+
+Thanks to the [LINUX DO](https://linux.do) community.
+
 ## License
 
 [MIT](LICENSE)

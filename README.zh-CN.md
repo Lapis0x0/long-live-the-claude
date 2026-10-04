@@ -99,6 +99,10 @@ claude --plugin-dir .
 
 在这个会话里运行 `/plugin-types`，插件 API 的类型声明会写进 `.claude/types`。之后用 `tsc -p tsconfig.json` 做类型检查，用 `claude plugin validate .claude-plugin/plugin.json` 按 Claude Code 加载插件的方式检查一遍。
 
+## 友情链接
+
+感谢 [LINUX DO](https://linux.do) 社区。
+
 ## 许可证
 
 [MIT](LICENSE)
