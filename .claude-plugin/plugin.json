@@ -1,0 +1,11 @@
+{
+  "name": "long-live-the-claude",
+  "version": "0.1.0",
+  "description": "Keeps long-running Claude Code sessions alive: a usage band above the prompt, prompt-cache keep-alive across idle gaps, and a graceful pause at 95% of the 5-hour limit that wakes the session when it resets.",
+  "author": { "name": "Lapis0x0", "url": "https://github.com/Lapis0x0" },
+  "homepage": "https://github.com/Lapis0x0/long-live-the-claude",
+  "repository": "https://github.com/Lapis0x0/long-live-the-claude",
+  "license": "MIT",
+  "keywords": ["long-running", "prompt-cache", "usage-limits", "keep-alive"],
+  "types": "./types/index.d.ts"
+}

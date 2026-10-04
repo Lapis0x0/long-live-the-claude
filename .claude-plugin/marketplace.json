@@ -1,0 +1,14 @@
+{
+  "name": "long-live-the-claude",
+  "owner": { "name": "Lapis0x0", "url": "https://github.com/Lapis0x0" },
+  "metadata": {
+    "description": "Long Live the Claude: keeps long-running Claude Code sessions alive."
+  },
+  "plugins": [
+    {
+      "name": "long-live-the-claude",
+      "source": "./",
+      "description": "A usage band above the prompt, prompt-cache keep-alive across idle gaps, and a graceful pause at 95% of the 5-hour limit that wakes the session when it resets."
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{ "extends": "./.claude/types/tsconfig.json" }

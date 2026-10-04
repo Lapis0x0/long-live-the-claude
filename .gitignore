@@ -1,0 +1,4 @@
+# API declarations written by /plugin-types; regenerate locally
+.claude/
+.DS_Store
+node_modules/
