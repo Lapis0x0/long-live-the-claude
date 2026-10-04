@@ -52,7 +52,13 @@ Requirements:
 - Claude Code **2.1.286** or later (plugins with function hooks).
 - A Claude subscription (Pro or Max) for the `5h` / `7d` readings and the usage pause. With an API key, the band shows the context and cache only, and keep-alive still works.
 
-From the plugin marketplace:
+The easiest way is to ask Claude Code itself:
+
+```
+Hey Claude, install this mod for me: https://github.com/Lapis0x0/long-live-the-claude
+```
+
+Or from the plugin marketplace:
 
 ```
 /plugin marketplace add Lapis0x0/long-live-the-claude

@@ -52,7 +52,13 @@
 - Claude Code **2.1.286** 或更新版本（支持 function hooks 插件）。
 - `5h` / `7d` 读数和额度暂停需要 Claude 订阅（Pro 或 Max）。使用 API key 时，用量条只显示上下文和缓存，保温功能照常可用。
 
-通过插件市场安装：
+最简单的方式是直接让 Claude Code 帮你装：
+
+```
+嗨 Claude，帮我安装一下这个 mod：https://github.com/Lapis0x0/long-live-the-claude
+```
+
+或者通过插件市场安装：
 
 ```
 /plugin marketplace add Lapis0x0/long-live-the-claude
