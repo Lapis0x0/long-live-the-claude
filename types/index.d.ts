@@ -31,6 +31,12 @@ export type LongRunState = {
   pausedAt: number | null
   /** The text of background notifications held during the pause, handed to the model at wake-up */
   held: string[]
+  /**
+   * The model ended its last main-conversation turn with [idle] (or the person interrupted the turn):
+   * it considers itself done. While true, idle gaps only get a forked keep-alive; while false, they get
+   * a check-in turn in the conversation. Re-decided at the end of every main-conversation turn
+   */
+  isIdle: boolean
 }
 
 export type ContextState = {

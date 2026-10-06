@@ -19,6 +19,7 @@ const LONG_RUN_OFF: LongRunState = {
   isReminded: false,
   pausedAt: null,
   held: [],
+  isIdle: false,
 }
 const longRun = atom({ plugin: 'long-live-the-claude', key: 'longRun' } as const, LONG_RUN_OFF)
 const now = atom({ plugin: 'long-live-the-claude', key: 'now' } as const, 0)
@@ -42,6 +43,20 @@ const HIT_RATIO = 0.5
 
 const KEEPALIVE_PROMPT =
   '[cache keep-alive] This is an automatic keep-alive request from the long-live-the-claude plugin. Nothing to do; reply with just "ok".'
+
+// Check-in: while the model has not marked [idle], an idle gap is refreshed by a turn in the main
+// conversation instead of a fork. The person sees only this short line; the instructions are
+// appended as a row only the model reads
+const NUDGE_LABEL = '[long run] check-in'
+const nudgeText = (idleFor: number) =>
+  `[long-live-the-claude · long-run check-in] The main conversation has been idle for about ${roughly(idleFor)}. ` +
+  'This is an automatic check-in from the plugin, not a new message from the user. ' +
+  'If there is work to move forward, or a background task or remote job you were waiting on should have finished by now, check on it and continue. ' +
+  'If what you are waiting on is still running normally, a brief confirmation before ending the turn is enough; no extra work is needed. ' +
+  'If you judge that you should genuinely stop (the task is done, or you are waiting for the user), put [idle] alone on the last line of your reply: ' +
+  'check-ins then stop and only the cache is kept warm, until a new message arrives in the conversation.'
+// The reply's last line is [idle] on its own
+const IDLE_MARK = /(^|\n)[ \t]*\[idle\][ \t]*$/
 
 // Long-run mode: once the 5-hour window reaches this percentage, ask the model to wrap up
 // and pause after the turn until the window resets
@@ -130,6 +145,12 @@ let debugEveryMs: number | null = null
 let storeKey: string | null = null
 let isWaking = false
 let wakeRetryAt = 0
+// Check-ins: isNudging while a submission is on its way in; isNudgeTurn while a check-in's turn runs;
+// nudgeSteps counts that turn's requests, and more than one means the model got to work (real activity)
+let isNudging = false
+let isNudgeTurn = false
+let nudgeSteps = 0
+let nudgeIdleFor = 0
 
 async function setLongRun($: Engine, fn: (x: LongRunState) => LongRunState) {
   await update($, longRun, fn)
@@ -272,7 +293,7 @@ async function keepAlive($: Engine, reason: 'auto' | 'manual'): Promise<string> 
       return note
     }
 
-    const note = `Last hit ${k(u.cache_read_input_tokens)} (${Math.round(ratio * 100)}%), ${u.output_tokens} tokens out`
+    const note = `Last: keep-alive hit ${Math.round(ratio * 100)}% (${k(u.cache_read_input_tokens)})`
     if (reason === 'auto') {
       await update($, warm, w => ({ ...w, count: w.count + 1, isFailing: false, note }))
     }
@@ -280,6 +301,45 @@ async function keepAlive($: Engine, reason: 'auto' | 'manual'): Promise<string> 
     return note
   } finally {
     isForking = false
+  }
+}
+
+// Starts a check-in turn in the main conversation
+async function nudge($: Engine): Promise<string> {
+  const t = await $.clock.now()
+  const w = await read($, warm)
+  nudgeIdleFor = w.lastTurnAt === null ? 0 : t - w.lastTurnAt
+  isNudging = true
+  try {
+    // The instructions go in first as a row the person does not see and the model reads (context a
+    // prompt.submit hook attaches to the plugin's own submission does not reach the model), then a
+    // short prompt starts the turn
+    const a = await $.session.append({
+      message: { type: 'user', content: [{ type: 'text', text: `<system-reminder>\n${nudgeText(nudgeIdleFor)}\n</system-reminder>` }] },
+    })
+    if (a.deny !== undefined) $.ui.toast(`Check-in instructions not appended (${a.deny})`)
+    const r = await $.prompt.submit({ text: NUDGE_LABEL }).catch((err: unknown) => ({ drop: String(err) }))
+    if (r.drop !== undefined) {
+      const note = `Check-in not delivered: ${r.drop}`
+      retryAt = t + RETRY_MS
+      if (!w.isFailing) $.ui.toast(`${note}; retrying in 1 minute`)
+      await update($, warm, x => ({ ...x, isFailing: true, note }))
+
+      return note
+    }
+    // The turn has started; turn.start sets this too, but claim it now so the next tick does not resend.
+    // isNudgeTurn is set here as well: the plugin's own prompt.submit hook may not see its own submission
+    isBusy = true
+    if (!isNudgeTurn) {
+      isNudgeTurn = true
+      nudgeSteps = 0
+    }
+    const note = `Last: check-in (idle ${roughly(nudgeIdleFor)})`
+    await update($, warm, x => ({ ...x, count: x.count + 1, isFailing: false, note }))
+
+    return note
+  } finally {
+    isNudging = false
   }
 }
 
@@ -299,7 +359,7 @@ async function tick($: Engine) {
 
   const w = await read($, warm)
   const hit = await read($, lastHitAt)
-  if (w.isBroken || hit === null || isBusy || isForking || t < retryAt) return
+  if (w.isBroken || hit === null || isBusy || isForking || isNudging || t < retryAt) return
   // Idle too long: refreshing further would cost more than one rebuild on return; wait for the next real request
   if (w.lastTurnAt !== null && t - w.lastTurnAt > IDLE_CAP_MS) return
   // By the local clock the cache has expired: the timer could not refresh in time (the machine
@@ -312,7 +372,11 @@ async function tick($: Engine) {
     return
   }
   const dueAt = debugEveryMs !== null ? hit + debugEveryMs : hit + TTL_MS - LEAD_MS
-  if (t >= dueAt) await keepAlive($, 'auto')
+  if (t < dueAt) return
+  // The model has not said it is done: ask in the conversation, which refreshes the cache too;
+  // once it has (or while winding down or paused), just fork a keep-alive
+  if (lr.phase === 'run' && !lr.isIdle) await nudge($)
+  else await keepAlive($, 'auto')
 }
 
 // ---- The band above the prompt ----
@@ -416,7 +480,6 @@ async function drawBand($: Engine, e: ResolveInput) {
 
     return (
       <Box gap={1} alignItems="center">
-        <Text dimColor>{name}</Text>
         {meter(rest, `${name} ${rest}% left`, p === null ? undefined : Math.max(0, p.restAtReset))}
         <Text bold={rest <= 20}>{`${rest}%`}</Text>
       </Box>
@@ -439,28 +502,18 @@ async function drawBand($: Engine, e: ResolveInput) {
 
   const cacheText = left === null ? '—' : left > 0 ? countdown(left) : 'expired'
 
-  // ---- Details row: click the band to expand; resets, compaction headroom and keep-alive live here ----
-  const resetDetail = (name: string, win: RateWindow) => {
-    if (win.resetsAt === undefined) return null
+  // ---- Details: click the band to expand. Where the surface has Client each detail sits right below
+  // its reading; elsewhere they fall back to a row of their own ----
+  const resetLines = (win: RateWindow) => {
+    if (win.resetsAt === undefined) return []
     const resetIn = Date.parse(win.resetsAt) - t
     const p = project(win.kind, win.percentUsed, resetIn)
-    // The bar's translucent part already shows what is projected to be left; here we only warn when it runs out early
-    const forecast = p?.runsOutIn != null ? ` · runs out in ~${roughly(p.runsOutIn)} at this rate` : ''
 
-    return `${name} resets in ${roughly(resetIn)}${forecast}`
+    // The bar's translucent part already shows what is projected to be left; here we only warn when it runs out early
+    return [`resets in ${roughly(resetIn)}`, p?.runsOutIn != null ? `runs out in ~${roughly(p.runsOutIn)}` : null]
   }
 
-  const warmDetail = !lr.isOn
-    ? w.note
-    : w.isBroken || w.isFailing
-      ? w.note
-      : isIdleTooLong
-        ? `Idle over ${IDLE_CAP_MS / 3600_000}h, keep-alive stopped until the next request`
-        : hit === null
-          ? 'Keep-alive waiting for the next request'
-          : [`Kept warm ${w.count}×`, w.note].filter(x => x !== null).join(' · ')
-
-  // Long-run pause: a short badge in the main row, the full story in the details row
+  // Long-run pause: a short badge in the main row
   const wakeAt = lr.resetsAt === null ? null : lr.resetsAt + WAKE_DELAY_MS
   const pauseBadge =
     !lr.isOn || wakeAt === null
@@ -470,27 +523,30 @@ async function drawBand($: Engine, e: ResolveInput) {
         : lr.phase === 'paused'
           ? `Paused · resumes ${hhmm(wakeAt)}${lr.held.length > 0 ? ` · ${lr.held.length} held` : ''}`
           : null
-  const pauseDetail =
-    !lr.isOn || wakeAt === null
-      ? null
-      : lr.phase === 'winding'
-        ? `5h past ${PAUSE_AT}%: ${lr.isReminded ? 'asked the model to wrap up' : 'will ask the model to wrap up at its next tool call'}; pausing until ${hhmm(wakeAt)} once the turn ends`
-        : lr.phase === 'paused'
-          ? `Paused · resumes in ${roughly(wakeAt - t)} (${hhmm(wakeAt)}) · ${lr.held.length} notification${lr.held.length === 1 ? '' : 's'} held`
-          : null
+  // The details below the cache column: two lines at most, each truncated rather than wrapped, so
+  // they never push the buttons out
+  const held = lr.held.length
+  const keeperLines: (string | null)[] = !lr.isOn
+    ? [w.note]
+    : lr.phase === 'winding' && wakeAt !== null
+      ? [`Winding down · ${lr.isReminded ? 'model asked to wrap up' : 'asks at the next tool call'} · resumes ${hhmm(wakeAt)}`]
+      : lr.phase === 'paused' && wakeAt !== null
+        ? [`Paused · resumes in ${roughly(wakeAt - t)} (${hhmm(wakeAt)})`, `${held} notification${held === 1 ? '' : 's'} held`]
+        : w.isBroken || w.isFailing
+          ? [w.note]
+          : isIdleTooLong
+            ? [`Idle over ${IDLE_CAP_MS / 3600_000}h, stopped`, 'resumes at the next request']
+            : hit === null
+              ? ['Waiting for the next request']
+              : [`${lr.isIdle ? '[idle] · keep-alive only' : 'no [idle] · check-ins'} · kept warm ${w.count}×`, w.note]
 
-  const details = [
-    five && resetDetail('5h', five),
-    week && resetDetail('7d', week),
-    ctx?.tokens !== undefined ? `${k(Math.max(0, ctx.compactAt - ctx.tokens))} to auto-compact · model window ${k(ctx.window)}` : null,
-    pauseDetail,
-    warmDetail,
-  ].filter((x): x is string => typeof x === 'string' && x !== '')
+  const compactLine = ctx?.tokens !== undefined ? `${k(Math.max(0, ctx.compactAt - ctx.tokens))} to auto-compact` : null
+  const isText = (x: unknown): x is string => typeof x === 'string' && x !== ''
 
-  // Where the surface has Client, a transparent click probe covers each area except the buttons:
-  // a click anywhere toggles the details row. Without Client there are no clicks, so we fall back
-  // to the host's hover: hovering the band shows the details row.
-  // The probes must not cover the buttons: a probe layered above eats the button's click, and no
+  // Where the surface has Client, a transparent click probe covers the area left of the buttons:
+  // a click anywhere toggles the details. Without Client there are no clicks, so we fall back to
+  // the host's hover: hovering the band shows the details row.
+  // The probe must not cover the buttons: a probe layered above eats the button's click, and no
   // positioning order wins over it
   const Client = 'Client' in els ? els.Client : undefined
   const isExpanded = await read($, expanded)
@@ -502,52 +558,96 @@ async function drawBand($: Engine, e: ResolveInput) {
       </Box>
     ) : null
 
+  // One column: the standing reading on top and, when expanded, its details below.
+  // 5h and 7d pass a label: it stands on its own at the left (top-aligned, on the reading's line)
+  // and the details line up with the bar; ctx and cache pass none: the label is part of the
+  // reading and the details start at the column's left edge.
+  // The first three columns' details are no wider than their readings, so expanding does not shift
+  // the main row; the last column (cache and long run) may shrink and truncate instead of pushing the buttons
+  type El = ReturnType<typeof usage>
+  const column = (key: string, label: El | null, main: El, lines: unknown[], isLast = false) => {
+    const shown = Client && isExpanded ? lines.filter(isText) : []
+    const body = (
+      <Box key={`${key}-body`} flexDirection="column" flexShrink={isLast ? 1 : 0} minWidth={isLast ? 0 : undefined}>
+        {main}
+        {shown.map((d, i) => (
+          <Text key={`${key}-${i}`} dimColor wrap={isLast ? 'truncate-end' : undefined}>
+            {d}
+          </Text>
+        ))}
+      </Box>
+    )
+    if (label === null) return body
+
+    return (
+      <Box key={key} gap={1} alignItems="flex-start" flexShrink={0}>
+        {label}
+        {body}
+      </Box>
+    )
+  }
+  const label = (text: string) => (
+    <Box>
+      <Text dimColor>{text}</Text>
+    </Box>
+  )
+
+  // Without Client: the details stay a row of their own below the main row, shown on hover
+  const flat = [
+    five && `5h ${resetLines(five).filter(isText).join(' · ')}`,
+    week && `7d ${resetLines(week).filter(isText).join(' · ')}`,
+    compactLine,
+    ...keeperLines,
+  ].filter(isText)
   const detailRow =
-    details.length === 0 || (Client && !isExpanded) ? null : (
-      <Box
-        key="details"
-        position="relative"
-        columnGap={3}
-        flexWrap="wrap"
-        display={Client ? 'flex' : 'none'}
-        hover={Client ? undefined : { display: 'flex' }}
-      >
-        {details.map((d, i) => (
+    Client || flat.length === 0 ? null : (
+      <Box key="details" columnGap={3} flexWrap="wrap" display="none" hover={{ display: 'flex' }}>
+        {flat.map((d, i) => (
           <Text key={`d-${i}`} dimColor>
             {d}
           </Text>
         ))}
-        {probe('probe-details')}
       </Box>
     )
 
+  const cacheMain = (
+    <Box gap={1} alignItems="center">
+      {Svg ? (
+        <Svg
+          source={ringSvg(left === null ? 0 : left / TTL_MS, cacheTone, dot)}
+          alt={`cache ${cacheText}${isWarming ? ', kept warm' : ''}`}
+          width={RING}
+          height={RING}
+        />
+      ) : null}
+      <Text dimColor>cache</Text>
+      <Text color={left !== null && left <= LEAD_MS ? (left <= 0 ? 'error' : 'warning') : undefined}>{cacheText}</Text>
+      {/* No ring in the terminal: a word marks keep-alive as on */}
+      {!Svg && isWarming ? <Text dimColor>· warm</Text> : null}
+    </Box>
+  )
+
   return (
     <Box key="band" flexDirection="column">
-      <Box alignItems="stretch">
-        {/* The readings area stretches up to the buttons, so the gap before them is under the probe too */}
-        <Box key="usage-zone" position="relative" flexGrow={1} flexShrink={0} paddingRight={3} columnGap={3} alignItems="center">
-          {five && usage('5h', five)}
-          {week && usage('7d', week)}
-          {ctx?.tokens !== undefined && contextText({ ...ctx, tokens: ctx.tokens })}
-          <Box gap={1} alignItems="center">
-            {Svg ? (
-              <Svg
-                source={ringSvg(left === null ? 0 : left / TTL_MS, cacheTone, dot)}
-                alt={`cache ${cacheText}${isWarming ? ', kept warm' : ''}`}
-                width={RING}
-                height={RING}
-              />
-            ) : null}
-            <Text dimColor>cache</Text>
-            <Text color={left !== null && left <= LEAD_MS ? (left <= 0 ? 'error' : 'warning') : undefined}>
-              {cacheText}
-            </Text>
-            {/* No ring in the terminal: a word marks keep-alive as on */}
-            {!Svg && isWarming ? <Text dimColor>· warm</Text> : null}
-          </Box>
+      <Box alignItems="flex-start">
+        {/* The readings area stretches up to the buttons, so the gap before them and the expanded details are under the probe too */}
+        <Box
+          key="usage-zone"
+          position="relative"
+          flexGrow={1}
+          flexShrink={1}
+          minWidth={0}
+          paddingRight={3}
+          columnGap={3}
+          alignItems="flex-start"
+        >
+          {five && column('c-5h', label('5h'), usage('5h', five), resetLines(five))}
+          {week && column('c-7d', label('7d'), usage('7d', week), resetLines(week))}
+          {ctx?.tokens !== undefined && column('c-ctx', null, contextText({ ...ctx, tokens: ctx.tokens }), [compactLine])}
+          {column('c-cache', null, cacheMain, keeperLines, true)}
           {probe('probe-main')}
         </Box>
-        <Box gap={1} alignItems="center" flexShrink={1} minWidth={0}>
+        <Box gap={1} alignItems="center" flexShrink={0}>
           {pauseBadge !== null ? (
             <Box flexShrink={1} minWidth={0}>
               <Text color={lr.phase === 'paused' ? 'warning' : undefined} wrap="truncate-end">
@@ -591,7 +691,7 @@ async function drawBand($: Engine, e: ResolveInput) {
               await setLongRunOn($, isOn)
               $.ui.toast(
                 isOn
-                  ? `Long-run mode on: idle gaps kept warm, pauses at ${PAUSE_AT}% of the 5h limit until it resets`
+                  ? `Long-run mode on: idle gaps get check-ins (keep-alive only once the model marks [idle]), pauses at ${PAUSE_AT}% of the 5h limit until it resets`
                   : 'Long-run mode off',
               )
             }}
@@ -607,7 +707,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'long-run',
-      description: `Long-run mode: keep idle gaps warm, pause at ${PAUSE_AT}% of the 5h limit and wake at the reset. /long-run [on|off|test|sim <min>|debug <min>]`,
+      description: `Long-run mode: check in during idle gaps (keep-alive only once the model marks [idle]), pause at ${PAUSE_AT}% of the 5h limit and wake at the reset. /long-run [on|off|test|nudge|sim <min>|debug <min>]`,
     })
 
     storeKey = `longRun:${await $.session.id()}`
@@ -655,7 +755,10 @@ export const register: Register = on => {
     if (e.agentId === undefined && u) {
       const t = Date.now()
       await update($, lastHitAt, () => t)
-      await update($, warm, w => ({ ...w, lastTurnAt: t }))
+      // A check-in's turn is not activity, or the idle cap would never be reached; if the model
+      // gets to work, turn.complete records it
+      if (isNudgeTurn) nudgeSteps += 1
+      else await update($, warm, w => ({ ...w, lastTurnAt: t }))
       // The context the next request carries = this input (cache reads and writes included) + this
       // output, the same basis as Claude Code's own "Context window"; session.measure leaves out the output
       const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
@@ -680,7 +783,19 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       isBusy = false
+      if (isNudgeTurn && nudgeSteps > 1) {
+        const t = Date.now()
+        await update($, warm, w => ({ ...w, lastTurnAt: t }))
+      }
+      isNudgeTurn = false
+      nudgeSteps = 0
       const lr = await read($, longRun)
+      if (lr.isOn) {
+        // The model marked [idle], or the person interrupted the turn (they are here; do not carry on
+        // for them): keep-alive only. An API error does not count: a check-in is just what revives it
+        const isIdle = e.reason === 'aborted' || IDLE_MARK.test(e.answer.trimEnd())
+        if (isIdle !== lr.isIdle) await setLongRun($, x => ({ ...x, isIdle }))
+      }
       if (lr.isOn && lr.phase === 'winding') await enterPause($)
     }
 
@@ -691,6 +806,15 @@ export const register: Register = on => {
   // held and handed to the model at wake-up. What the person types goes through, and so does
   // anything delivered into a running turn (turnId set)
   on('prompt.submit', async ($, e, next) => {
+    // Our own check-in: mark the turn so turn.step and turn.complete can tell it apart
+    if (e.origin.kind === 'plugin' && e.origin.name === 'long-live-the-claude' && e.text === NUDGE_LABEL) {
+      isNudgeTurn = true
+      nudgeSteps = 0
+      const r = await next(e)
+      if (r.drop !== undefined) isNudgeTurn = false
+
+      return r
+    }
     const lr = await read($, longRun)
     if (!lr.isOn || lr.phase !== 'paused' || e.turnId !== undefined || !HELD_ORIGINS.has(e.origin.kind)) {
       return next(e)
@@ -733,7 +857,7 @@ export const register: Register = on => {
       const tail = hit === null ? ' There is no cache to keep yet; timing starts at the next request.' : ''
 
       return {
-        text: `Long-run mode on: idle gaps are kept warm (until ${IDLE_CAP_MS / 3600_000}h of idleness); at ${PAUSE_AT}% of the 5h limit the model is asked to wrap up, and the session pauses until the reset, then wakes.${tail}`,
+        text: `Long-run mode on: idle gaps get a check-in turn in the conversation, which also refreshes the cache, and once the model ends a reply with [idle] they are only kept warm (either way until ${IDLE_CAP_MS / 3600_000}h of idleness); at ${PAUSE_AT}% of the 5h limit the model is asked to wrap up, and the session pauses until the reset, then wakes.${tail}`,
       }
     }
 
@@ -747,6 +871,14 @@ export const register: Register = on => {
     if (arg === 'test') {
       if (isForking) return { text: 'A keep-alive is in flight; try again shortly.' }
       return { text: `Test keep-alive done: ${await keepAlive($, 'manual')}` }
+    }
+
+    // Sends one check-in now (a plugin's prompt waits until the session is idle, so it starts after this command)
+    if (arg === 'nudge') {
+      if (isNudging || isNudgeTurn) return { text: 'A check-in is already on its way.' }
+      void nudge($)
+
+      return { text: 'Check-in queued; it enters the conversation once this command ends.' }
     }
 
     // Tests the pause: pretend the 5h window just crossed the threshold and resets in N minutes
@@ -774,7 +906,7 @@ export const register: Register = on => {
       }
     }
 
-    return { text: 'Usage: /long-run [on] | off | test | sim <minutes> | debug <minutes>' }
+    return { text: 'Usage: /long-run [on] | off | test | nudge | sim <minutes> | debug <minutes>' }
   })
 
   on('ui.message', async ($, e, next) => {

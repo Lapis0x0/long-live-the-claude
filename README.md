@@ -22,11 +22,12 @@ Today's flagship models can work on their own for hours without a `/loop`: one l
 - `5h` and `7d`: how much of each window is left. The translucent part of the bar is what the current rate will use up before the reset.
 - `ctx`: the context in use against the auto-compaction window, the same basis as `/context`.
 - `cache`: a ring and countdown until the prompt cache expires.
-- Click the band for details: when each window resets, whether it will run out early at the current rate, the headroom to auto-compaction, and the keep-alive status.
+- Click the band for details, each right below its reading: when each window resets and whether it will run out early at the current rate, the headroom to auto-compaction, and the keep-alive status.
 
 **Long-run mode** (per conversation, off by default; the `Long run` button or `/long-run`)
 
-- **Keep-alive through idle gaps.** About 3 minutes before the cache would expire, the plugin sends a tiny request that reads the cached context and refreshes its lifetime. This covers every idle gap: you stepping away, the model waiting on a background job, or a usage pause.
+- **Keep-alive through idle gaps.** About 3 minutes before the cache would expire, the plugin refreshes it. This covers every idle gap: you stepping away, the model waiting on a background job, or a usage pause.
+- **Check-ins, so a stalled wait does not stall the session.** A model often ends its turn to wait on a background job, and if that job hangs or its notification never comes, nothing wakes the model again. So while the model has not said it is done, the refresh is a short turn in the conversation itself: a one-line `[long run] check-in`, plus a system reminder only the model sees, asking it to check on what it was waiting for and carry on, or simply end the turn if all is well. When the model judges it should genuinely stop (the task is done, or it is waiting for you), it ends its reply with `[idle]` on a line of its own; from then on the refresh is a silent forked request until the next new message. Interrupting a turn counts as `[idle]` too. A check-in reads the same cached context as a forked keep-alive, so it costs about the same.
 - **A graceful pause at 95% of the 5-hour window.** The next tool result the model gets carries a system reminder: the limit is nearly reached and resets at a given time, so it should bring the current step to a natural stop and end the turn. The model is not asked to write notes or checkpoints: for the model, the pause is just a gap between one message and the next.
 - **Notifications are held, not lost.** While paused, background task notifications and scheduled triggers do not start new turns. Their text is kept and handed to the model at wake-up. Anything you type yourself still goes through.
 - **Automatic wake-up.** Two minutes after the reset the plugin submits a prompt telling the model how long it was paused, together with the held notifications. Because the cache was kept warm, that first request is cheap.
@@ -81,8 +82,9 @@ claude --plugin-dir /path/to/long-live-the-claude
 | `/long-run` or `/long-run on` | Turn long-run mode on |
 | `/long-run off` | Turn it off; a pause in progress ends and held notifications go to the model right away |
 | `/long-run test` | Send one keep-alive and report the cache hit |
+| `/long-run nudge` | Send one check-in now |
 | `/long-run sim <minutes>` | Simulate crossing 95% with the window resetting in `<minutes>`, to watch a pause and wake-up end to end |
-| `/long-run debug <minutes>` | Keep warm every `<minutes>` instead of hourly, for testing |
+| `/long-run debug <minutes>` | Refresh every `<minutes>` instead of hourly, for testing |
 
 ## Settings
 
@@ -92,7 +94,7 @@ The thresholds are constants at the top of [`hooks/register.tsx`](hooks/register
 | --- | --- | --- |
 | `PAUSE_AT` | `95` | Percentage of the 5-hour window at which the wind-down starts |
 | `WAKE_DELAY_MS` | 2 minutes | How long after the reset to wake the session |
-| `IDLE_CAP_MS` | 36 hours | How long the conversation may sit idle before keep-alive stops |
+| `IDLE_CAP_MS` | 36 hours | How long the conversation may sit idle before keep-alive and check-ins stop |
 | `TTL_MS` | 1 hour | The assumed cache lifetime; a keep-alive that misses stops automatic keep-alive |
 
 ## Development
