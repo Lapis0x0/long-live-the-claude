@@ -562,13 +562,13 @@ async function drawBand($: Engine, e: ResolveInput) {
   // 5h and 7d pass a label: it stands on its own at the left (top-aligned, on the reading's line)
   // and the details line up with the bar; ctx and cache pass none: the label is part of the
   // reading and the details start at the column's left edge.
-  // The first three columns' details are no wider than their readings, so expanding does not shift
-  // the main row; the last column (cache and long run) may shrink and truncate instead of pushing the buttons
+  // No column shrinks (shrinking squeezes a reading until its parts overlap); when the band is too
+  // narrow, whole columns wrap to the next line instead of pushing the buttons
   type El = ReturnType<typeof usage>
   const column = (key: string, label: El | null, main: El, lines: unknown[], isLast = false) => {
     const shown = Client && isExpanded ? lines.filter(isText) : []
     const body = (
-      <Box key={`${key}-body`} flexDirection="column" flexShrink={isLast ? 1 : 0} minWidth={isLast ? 0 : undefined}>
+      <Box key={`${key}-body`} flexDirection="column" flexShrink={0}>
         {main}
         {shown.map((d, i) => (
           <Text key={`${key}-${i}`} dimColor wrap={isLast ? 'truncate-end' : undefined}>
@@ -639,6 +639,7 @@ async function drawBand($: Engine, e: ResolveInput) {
           minWidth={0}
           paddingRight={3}
           columnGap={3}
+          flexWrap="wrap"
           alignItems="flex-start"
         >
           {five && column('c-5h', label('5h'), usage('5h', five), resetLines(five))}
